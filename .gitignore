@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.env
+
+# ML models
+backend/models/*.pkl
+
+# Node
+node_modules/
+.next/
+frontend/node_modules/
+
+# Misc
+.DS_Store
+*.log
