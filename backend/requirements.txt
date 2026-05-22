@@ -1,0 +1,7 @@
+flask
+flask-cors
+supabase
+python-jose[cryptography]
+bcrypt
+python-dotenv
+requests
