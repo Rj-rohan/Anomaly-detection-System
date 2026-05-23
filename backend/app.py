@@ -13,6 +13,7 @@ app = Flask(__name__)
 CORS(app, origins=[
     "http://localhost:3000",
     "https://anomaly-frontend.onrender.com",
+    "https://anomaly-detection-system-frontend.onrender.com",
     os.getenv("FRONTEND_URL", ""),
 ])
 
