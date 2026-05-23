@@ -13,7 +13,7 @@ phases:
       - echo "Installing backend dependencies..."
       - pip install -r backend/requirements.txt
       - echo "Installing frontend dependencies..."
-      - cd frontend/my-app && npm install && cd ../..
+      - npm install --prefix frontend/my-app
 
   pre_build:
     commands:
@@ -32,22 +32,19 @@ phases:
       - echo "NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}" > frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}" >> frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}" >> frontend/my-app/.env.local
-      - echo "Env files written successfully"
+      - echo "Env files written"
 
   build:
     commands:
       - echo "Building Next.js frontend..."
-      - cd frontend/my-app && npm run build && cd ../..
+      - npm run build --prefix frontend/my-app
       - echo "Creating models directory..."
       - mkdir -p backend/models
       - echo "Packaging backend..."
       - zip -r backend-build.zip backend/ -x "backend/__pycache__/*" -x "backend/*.pyc" -x "backend/models/*.pkl"
       - echo "Packaging frontend..."
       - zip -r frontend-build.zip frontend/my-app/.next frontend/my-app/public frontend/my-app/package.json frontend/my-app/next.config.mjs frontend/my-app/.env.local
-
-  post_build:
-    commands:
-      - echo "Build completed successfully"
+      - echo "Build completed"
       - ls -lh backend-build.zip frontend-build.zip
 
 artifacts:
