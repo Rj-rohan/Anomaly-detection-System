@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, timezone, timedelta
 from functools import wraps
+import os
 import requests as http
 from user_agents import parse as parse_ua
 from db import supabase
@@ -9,7 +10,11 @@ from auth import hash_password, verify_password, create_token, decode_token
 from risk_engine import analyze
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000"])
+CORS(app, origins=[
+    "http://localhost:3000",
+    "https://anomaly-frontend.onrender.com",
+    os.getenv("FRONTEND_URL", ""),
+])
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -492,4 +497,6 @@ def latest_feed():
     return jsonify(feed[:20])
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    import os
+    port = int(os.getenv("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
