@@ -1,0 +1,93 @@
+version: 0.2
+
+env:
+  parameter-store:
+    SUPABASE_URL: "/anomaly/SUPABASE_URL"
+    SUPABASE_KEY: "/anomaly/SUPABASE_KEY"
+    JWT_SECRET: "/anomaly/JWT_SECRET"
+    TELEGRAM_BOT_TOKEN: "/anomaly/TELEGRAM_BOT_TOKEN"
+    TELEGRAM_CHAT_ID: "/anomaly/TELEGRAM_CHAT_ID"
+    NEXT_PUBLIC_SUPABASE_URL: "/anomaly/NEXT_PUBLIC_SUPABASE_URL"
+    NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: "/anomaly/NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY"
+    NEXT_PUBLIC_API_URL: "/anomaly/NEXT_PUBLIC_API_URL"
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+      nodejs: 18
+    commands:
+      # ── Backend dependencies (from root, full path) ──
+      - echo "Installing backend dependencies..."
+      - pip install -r backend/requirements.txt
+
+      # ── Frontend dependencies (from root, full path) ──
+      - echo "Installing frontend dependencies..."
+      - cd frontend/my-app && npm install && cd ../..
+
+  pre_build:
+    commands:
+      # ── Write backend .env from SSM Parameter Store ──
+      - echo "Writing backend .env..."
+      - |
+        cat > backend/.env << EOF
+        SUPABASE_URL=${SUPABASE_URL}
+        SUPABASE_KEY=${SUPABASE_KEY}
+        JWT_SECRET=${JWT_SECRET}
+        TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+        TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+        SMTP_HOST=smtp.gmail.com
+        SMTP_PORT=587
+        SMTP_USER=
+        SMTP_PASS=
+        ALERT_EMAIL=
+        EOF
+
+      # ── Write frontend .env.local from SSM Parameter Store ──
+      - echo "Writing frontend .env.local..."
+      - |
+        cat > frontend/my-app/.env.local << EOF
+        NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}
+        NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+        EOF
+
+      # ── Verify backend imports work ──
+      - echo "Verifying backend..."
+      - cd backend && python -c "from app import app; print('Backend OK')" && cd ..
+
+  build:
+    commands:
+      # ── Build Next.js frontend (from root) ──
+      - echo "Building frontend..."
+      - cd frontend/my-app && npm run build && cd ../..
+
+      # ── Create models directory if not exists ──
+      - mkdir -p backend/models
+
+      # ── Package backend ──
+      - echo "Packaging backend..."
+      - zip -r backend-build.zip backend/ -x "backend/__pycache__/*" -x "backend/*.pyc"
+
+      # ── Package frontend ──
+      - echo "Packaging frontend..."
+      - zip -r frontend-build.zip frontend/my-app/.next frontend/my-app/public frontend/my-app/package.json frontend/my-app/next.config.mjs
+
+  post_build:
+    commands:
+      - echo "Build completed successfully"
+      - echo "Backend zip size:" && du -sh backend-build.zip
+      - echo "Frontend zip size:" && du -sh frontend-build.zip
+
+artifacts:
+  files:
+    - backend-build.zip
+    - frontend-build.zip
+    - appspec.yml
+    - scripts/**/*
+  discard-paths: no
+
+cache:
+  paths:
+    - frontend/my-app/node_modules/**/*
+    - /root/.cache/pip/**/*

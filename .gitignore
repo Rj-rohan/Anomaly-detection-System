@@ -16,3 +16,6 @@ frontend/node_modules/
 # Misc
 .DS_Store
 *.log
+
+# Keep scripts in git
+!scripts/
