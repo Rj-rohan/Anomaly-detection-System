@@ -46,15 +46,15 @@ ANALYST_USERS = [
 ]
 
 
-def rand_dt(days_ago_max=30, days_ago_min=1, hour_min=8, hour_max=18):
+def rand_dt(days_ago_max=30, days_ago_min=1, hour_min=8, hour_max=22):
     days_ago = random.randint(days_ago_min, days_ago_max)
     hour = random.randint(hour_min, hour_max)
     minute = random.randint(0, 59)
-    dt = datetime.now(timezone.utc) - timedelta(days=days_ago, hours=0)
+    dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
     return dt.replace(hour=hour, minute=minute, second=random.randint(0, 59), microsecond=0)
 
 
-def generate_logs_for_user(user_id, home_city, device, n_normal=40, n_anomaly=6):
+def generate_logs_for_user(user_id, home_city, device, n_normal=60, n_anomaly=6):
     logs = []
 
     # Normal logins — business hours, known device, home city

@@ -8,14 +8,15 @@ A full-stack web application that monitors user login behavior, detects anomalie
 
 ## Tech Stack
 
-| Layer      | Technology                        |
-|------------|-----------------------------------|
-| Frontend   | Next.js 16, Tailwind CSS, Recharts |
-| Backend    | Python Flask                      |
-| Database   | Supabase (PostgreSQL)             |
-| Auth       | JWT (python-jose) + bcrypt        |
-| ML Model   | Scikit-learn Isolation Forest     |
-| Alerts     | Telegram Bot API + Email SMTP     |
+| Layer      | Technology                                          |
+|------------|-----------------------------------------------------|
+| Frontend   | Next.js 16, Tailwind CSS, Recharts, react-simple-maps |
+| Backend    | Python Flask                                        |
+| Database   | Supabase (PostgreSQL)                               |
+| Auth       | JWT (python-jose) + bcrypt                          |
+| ML Model   | Scikit-learn Isolation Forest                       |
+| Alerts     | Telegram Bot API + Email SMTP + In-app Toast        |
+| Export     | CSV (alerts + logs), PDF (risk profile)             |
 
 ---
 
@@ -28,7 +29,7 @@ Anomaly/
 │   ├── app.py                   ← Flask API (all routes)
 │   ├── auth.py                  ← JWT token creation/verification + bcrypt
 │   ├── db.py                    ← Supabase client
-│   ├── risk_engine.py           ← 9 anomaly rules + ML integration
+│   ├── risk_engine.py           ← 9 anomaly rules + ML + decay scoring
 │   ├── ml_model.py              ← Isolation Forest train/predict
 │   ├── generate_dataset.py      ← Synthetic dataset seeder + model trainer
 │   ├── alerts.py                ← Telegram + Email alert dispatcher
@@ -37,16 +38,22 @@ Anomaly/
 │   └── .env                     ← Environment variables
 └── frontend/my-app/
     ├── app/
-    │   ├── login/page.js
+    │   ├── login/page.js        ← Login with attempt counter + cooldown
     │   ├── register/page.js
     │   ├── dashboard/
-    │   │   ├── admin/           ← Admin dashboard + alerts + incidents + users
-    │   │   ├── analyst/         ← Analyst dashboard + incidents + logs
-    │   │   └── user/            ← User activity + security alerts + actions
+    │   │   ├── admin/           ← Dashboard, alerts, incidents, users
+    │   │   │   ├── logs/        ← Splunk-style log search
+    │   │   │   ├── map/         ← GeoIP world map
+    │   │   │   └── risk-profile/← Per-user risk profile + PDF export
+    │   │   ├── analyst/         ← Incidents, login logs
+    │   │   └── user/            ← Activity, alerts, self-service actions
     │   └── layout.js
     ├── components/
     │   ├── Sidebar.js           ← Role-aware navigation
     │   ├── DashboardLayout.js   ← Auth guard + layout wrapper
+    │   ├── AlertToaster.js      ← Real-time toast notifications
+    │   ├── LiveFeed.js          ← Live event feed (5s polling)
+    │   ├── GeoMap.js            ← World map component
     │   └── ui.js                ← StatCard, SeverityBadge, RiskBar, etc.
     ├── lib/
     │   ├── api.js               ← All API call functions
@@ -121,10 +128,8 @@ alter table user_profiles disable row level security;
 alter table alerts disable row level security;
 alter table incidents disable row level security;
 
--- Add is_blocked if upgrading existing schema
 alter table users add column if not exists is_blocked boolean default false;
 
--- Update severity constraint if upgrading
 alter table alerts drop constraint if exists alerts_severity_check;
 alter table alerts add constraint alerts_severity_check
   check (severity in ('Low','Medium','High','Critical'));
@@ -147,7 +152,7 @@ cd backend
 python generate_dataset.py
 ```
 
-This creates 5 demo users with 46 login logs each and trains an Isolation Forest model per user.
+Creates 5 demo users with 46 login logs each and trains an Isolation Forest model per user.
 
 ### Step 4 — Frontend
 
@@ -166,9 +171,9 @@ Runs on: `http://localhost:3000`
 ### backend/.env
 
 ```
-SUPABASE_URL=https://lrbaejmalycgqvyvymqf.supabase.co
-SUPABASE_KEY=<your_supabase_service_key>
-JWT_SECRET=super-secret-jwt-key-change-in-production
+SUPABASE_URL=your_supabase_url
+SUPABASE_KEY=your_supabase_service_key
+JWT_SECRET=your_jwt_secret_key
 TELEGRAM_BOT_TOKEN=          # optional
 TELEGRAM_CHAT_ID=            # optional
 SMTP_HOST=smtp.gmail.com     # optional
@@ -181,8 +186,8 @@ ALERT_EMAIL=                 # optional
 ### frontend/my-app/.env.local
 
 ```
-NEXT_PUBLIC_SUPABASE_URL=https://lrbaejmalycgqvyvymqf.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=<your_publishable_key>
+NEXT_PUBLIC_SUPABASE_URL=your_supabase_url
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your_publishable_key
 NEXT_PUBLIC_API_URL=http://localhost:5000
 ```
 
@@ -217,8 +222,8 @@ NEXT_PUBLIC_API_URL=http://localhost:5000
 | Role | Access |
 |------|--------|
 | user | Login, view own login history, view own security alerts, report suspicious activity, change password |
-| admin | Dashboard, failed attempts by user, block/unblock users, reset passwords, ML model status, retrain models, alerts, incidents, users list |
-| analyst | Incidents (investigate/update status/notes), login logs |
+| admin | Dashboard, log search, GeoIP map, risk profiles, failed attempts, block/unblock/reset users, ML status, retrain, alerts, incidents, CSV/PDF export |
+| analyst | Incidents (investigate/update), login logs |
 
 > Admin account is pre-seeded only. Registration is restricted to `user` and `analyst` roles.
 
@@ -243,10 +248,17 @@ Capture Metadata:
 Store in login_logs table
         ↓
 Anomaly Detection Layer (risk_engine.py)
+  - 9 rule-based anomaly checks (sliding windows)
+  - Isolation Forest ML prediction
+  - Exponential decay scoring formula
         ↓
-Risk Engine → Generate Alert + Incident
+Risk Score = prev_risk × 0.8 + event_score  (capped at 100)
         ↓
-Dispatch Alert (Telegram + Email)
+Generate Alert + Incident
+        ↓
+If Critical → Auto-block user
+        ↓
+Dispatch Alert (Telegram + Email + In-app Toast)
         ↓
 Admin notified → Analyst investigates → Incident resolved
 ```
@@ -255,17 +267,116 @@ Admin notified → Analyst investigates → Incident resolved
 
 ## Anomaly Detection — 9 Rules
 
-| # | Anomaly | Trigger | Risk Score |
-|---|---------|---------|------------|
-| A1 | Multiple Failed Login Attempts | ≥5 failed attempts within 10 minutes | +40 |
+| # | Anomaly | Trigger | Event Score |
+|---|---------|---------|-------------|
+| A1 | Multiple Failed Login Attempts | ≥3 failed attempts within 10 min sliding window | +40 |
 | A2 | Unusual Login Timing | Login between 10PM–6AM | +30 |
 | A3 | Consecutive Failures → Sudden Success | 4 consecutive failures then success | +20 |
-| A4 | Excessive Login Frequency | >10 logins in 24 hours | +15 |
+| A4 | Excessive Login Frequency | >10 logins in last 24h sliding window | +15 |
 | A5 | New Device Login | Device not in user's known devices | +15 |
 | A6 | Location Change Anomaly | Location not in user's known locations | +20 |
-| A7 | Impossible Travel | Speed between two locations >900 km/h within 2 hours | +35 |
-| A8 | Restricted Hours (Org Policy) | Login between 8PM–8AM (policy violation) | +20 |
-| A9 | Repeated Alert History | ≥5 alerts generated this month | +25 |
+| A7 | Impossible Travel | Speed between two locations >900 km/h within 2h | +35 |
+| A8 | Restricted Hours (Org Policy) | Login between 8PM–8AM | +20 |
+| A9 | Repeated Alert History | ≥5 alerts this month — context info only, no score added | — |
+
+> A9 is shown as context information only. It does not add to the score to prevent score inflation.
+
+---
+
+## Risk Scoring Engine — Industry-Grade Design
+
+### The Problem with Naive Scoring
+Simple additive scoring causes **score inflation** — every event adds to a running total, so even normal users eventually become Critical. Real security systems avoid this.
+
+### Solution: Three-Layer Approach
+
+#### 1. Sliding Time Windows
+Each anomaly only evaluates events within a fixed recent window:
+- A1: last **10 minutes** only
+- A4: last **24 hours** only
+- Events outside the window are completely ignored
+
+```
+10:00 AM → 3 failures in 10 min → A1 fires (+40)
+11:00 AM → those failures are now outside the window → A1 does NOT fire
+```
+
+#### 2. Exponential Decay Formula
+```
+final_score = previous_risk × 0.8 + current_event_score
+```
+Old risk fades unless new events keep it elevated:
+
+```
+10:00 AM: prev=0,  event=40 → final = 0×0.8 + 40 = 40  (Medium)
+11:00 AM: prev=40, event=0  → no alert generated
+12:00 PM: prev=40, event=40 → final = 40×0.8 + 40 = 72 (High)
+01:00 PM: prev=72, event=0  → no alert generated
+02:00 PM: prev=72, event=0  → no alert generated
+  (score naturally decays in the background)
+```
+
+#### 3. Success Decay (Behavior Reset)
+After **3 consecutive clean logins** within 24 hours:
+```
+new_risk = previous_risk × 0.3
+```
+A user at 60 (Medium) who logs in cleanly 3 times → drops to 18 (Low).
+This rewards normal behavior and prevents permanent flagging.
+
+#### Score Cap
+Final score is always capped at **100** regardless of how many anomalies fire simultaneously.
+
+### Severity Levels (Updated)
+
+| Score | Severity | Auto-block? |
+|-------|----------|-------------|
+| 0–30 | Low | No |
+| 31–60 | Medium | No |
+| 61–85 | High | No |
+| 86–100 | Critical | Yes — automatic |
+
+### Scoring Example
+
+```
+Previous risk score:       40  (from earlier brute-force)
+Current event:
+  A1: 3 failures in 10 min = +40
+  A2: Login at 2AM         = +30
+  ML: Isolation Forest     = +18
+  Total event score        = 88
+
+Final = 40 × 0.8 + 88 = 120 → capped at 100 → Critical → AUTO-BLOCKED
+```
+
+---
+
+## Auto-Block System
+
+When a user's final risk score reaches **Critical (≥86)**:
+1. `is_blocked = true` set in database immediately
+2. All future login attempts return `403 Account is blocked`
+3. Alert reason includes `AUTO-BLOCKED` tag
+4. Incident created with note "Auto-blocked by system"
+5. Admin can manually unblock from Users page or Dashboard
+
+Manual block/unblock is also available for any user at any risk level.
+
+---
+
+## Login Screen Security Warnings
+
+The login page shows progressive warnings based on failed attempt count:
+
+| Attempts | UI Response |
+|----------|-------------|
+| 1 | Plain error message |
+| 2 | Yellow warning — "1 more will trigger a security alert" |
+| 3+ | Red danger banner — "Security Alert — reported to security team" |
+| 3+ | Sign In button **disabled** for **5 minutes** with live countdown |
+| Blocked | Sign In button permanently disabled — "Contact administrator" |
+
+A progress bar shows `X / 3 threshold` turning red at the threshold.
 
 ---
 
@@ -305,50 +416,89 @@ ML Risk Score = (-raw_score + 0.5) × 40   →   range: 0–40
 
 ---
 
-## Risk Scoring
-
-```
-Final Risk Score = Rule Scores (A1–A9) + ML Score (0–40)
-```
-
-### Severity Levels
-
-| Score | Severity |
-|-------|----------|
-| 0–30 | Low |
-| 31–60 | Medium |
-| 61–100 | High |
-| >100 | Critical |
-
-### Example
-
-```
-A1: Multiple failed attempts     = +40
-A2: Unusual login timing         = +30
-A7: Impossible travel            = +35
-ML: Isolation Forest anomaly     = +28
-─────────────────────────────────────
-Total Risk Score                 = 133 → Critical
-```
-
----
-
 ## Alert Format
 
 ```
 🔴 Security Alert — Critical
 
 User: Rohan Sharma
-Risk Score: 133
+Risk Score: 100
 Anomalies Detected:
-• A1: Multiple failed login attempts (6 in 10 min)
-• A2: Unusual login timing (02:00 — outside normal hours)
-• A7: Impossible travel detected (Pune → New York in 0.5h, ~11200 km/h)
-• ML: Isolation Forest anomaly detected (score: -0.42, contribution: +28)
+• Score: 40 × 0.8 (decay) + 88 (event) = 100
+• A1: 3 failed attempts in last 10 min (threshold: 3)
+• A2: Unusual login timing (02:00 — outside 6AM–10PM)
+• ML: Isolation Forest anomaly (raw=-0.42, +18)
+• AUTO-BLOCKED: Account blocked due to Critical risk score
 Severity: Critical
 ```
 
-Sent via: Telegram Bot + Email SMTP
+Sent via: Telegram Bot + Email SMTP + In-app Toast notification
+
+---
+
+## Real-Time Alert Toast (In-App)
+
+The `AlertToaster` component polls `/api/alerts` every **5 seconds** on admin and analyst dashboards:
+- Sets a baseline timestamp on first load
+- Only shows toasts for alerts created **after** the dashboard was opened
+- Deduplicates using a shown-IDs set
+- Auto-dismisses after **8 seconds**
+- Shows severity badge + all anomaly reasons + AUTO-BLOCKED tag if applicable
+- Max 5 toasts visible simultaneously
+
+---
+
+## Splunk-Style Log Search (`/dashboard/admin/logs`)
+
+- Full-text search across user, IP, location, device, browser
+- Filter by status (success/failed) and date range
+- Events-per-hour bar chart (last 24h)
+- Top 10 source IPs with bar indicators
+- Top 10 locations with bar indicators
+- Export all logs to CSV
+
+---
+
+## GeoIP Map (`/dashboard/admin/map`)
+
+- World map with login pins (green = success, red = failed)
+- Hover tooltip: user, location, status, timestamp
+- Filter by all / success / failed
+- Zoomable and pannable
+- Table of recent mapped events below map
+
+---
+
+## User Risk Profile (`/dashboard/admin/risk-profile`)
+
+- Select any user from dropdown
+- Risk score history line chart
+- Behavior baseline: avg login hour, known devices, known locations
+- Full alert history with all anomaly bullets
+- Account status (Active / Blocked)
+- Export to PDF (jsPDF)
+- Accessible via "Profile" button on failed attempts table
+
+---
+
+## CSV / PDF Export
+
+| Export | Format | Access | Content |
+|--------|--------|--------|---------|
+| Alerts | CSV | Admin | All alerts with user, score, severity, reason |
+| Login Logs | CSV | Admin | All login events with IP, device, location |
+| Risk Profile | PDF | Admin | Per-user risk history, baseline, alert list |
+
+---
+
+## Live Event Feed
+
+The `LiveFeed` component on the admin dashboard:
+- Combines alerts + login events into a single chronological feed
+- Auto-refreshes every **5 seconds**
+- Live/Pause toggle
+- Color-coded: red border for alerts, gray for login events
+- Shows user, message, severity, timestamp
 
 ---
 
@@ -362,7 +512,7 @@ Sent via: Telegram Bot + Email SMTP
 | email | text | Unique email |
 | password | text | bcrypt hashed |
 | role | text | user / admin / analyst |
-| is_blocked | boolean | Account blocked flag |
+| is_blocked | boolean | Account blocked flag (manual or auto) |
 | created_at | timestamptz | Registration time |
 
 ### login_logs
@@ -393,8 +543,8 @@ Sent via: Telegram Bot + Email SMTP
 |--------|------|-------------|
 | id | uuid | Primary key |
 | user_id | uuid | FK → users |
-| risk_score | int | Calculated risk score |
-| reason | text | Pipe-separated anomaly list |
+| risk_score | int | Final decayed risk score (0–100) |
+| reason | text | Pipe-separated anomaly list including decay formula |
 | severity | text | Low / Medium / High / Critical |
 | status | text | open / closed |
 | created_at | timestamptz | Alert time |
@@ -423,30 +573,35 @@ Sent via: Telegram Bot + Email SMTP
 ### Logs
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | /api/logs | admin, analyst | All login logs (filter by user_id) |
+| GET | /api/logs | admin, analyst | All login logs |
 | GET | /api/logs/me | Any auth | Current user's login history |
+| GET | /api/logs/search | admin, analyst | Splunk-style search with filters |
+| GET | /api/logs/stats | admin, analyst | Hourly chart, top IPs, top locations |
+| GET | /api/logs/geo | admin, analyst | Geocoded login points for map |
 
 ### Alerts & Incidents
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
 | GET | /api/alerts | admin, analyst | All alerts with user info |
-| GET | /api/incidents | admin, analyst | All incidents with alert + user info |
+| GET | /api/incidents | admin, analyst | All incidents |
 | PATCH | /api/incidents/:id | admin, analyst | Update incident status and notes |
+| GET | /api/feed/latest | admin, analyst | Live feed — alerts + logins combined |
 
 ### Dashboard
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
-| GET | /api/dashboard/stats | admin, analyst | Total users, alerts, high risk, failed logins |
-| GET | /api/dashboard/risk_trend | admin, analyst | Risk score over time for chart |
-| GET | /api/dashboard/failed-by-user | admin | Failed attempt counts per user with block status |
+| GET | /api/dashboard/stats | admin, analyst | Summary stats |
+| GET | /api/dashboard/risk_trend | admin, analyst | Risk score over time |
+| GET | /api/dashboard/failed-by-user | admin | Failed attempts per user |
 
 ### User Management (Admin)
 | Method | Endpoint | Access | Description |
 |--------|----------|--------|-------------|
 | GET | /api/users | admin | All users list |
-| PATCH | /api/users/:id/block | admin | Block a user account |
-| PATCH | /api/users/:id/unblock | admin | Unblock a user account |
+| PATCH | /api/users/:id/block | admin | Block a user |
+| PATCH | /api/users/:id/unblock | admin | Unblock a user |
 | PATCH | /api/users/:id/reset-password | admin | Reset user password |
+| GET | /api/users/:id/risk-profile | admin, analyst | Full risk profile for a user |
 
 ### User Self-Service
 | Method | Endpoint | Access | Description |
@@ -461,35 +616,46 @@ Sent via: Telegram Bot + Email SMTP
 | GET | /api/ml/status | admin | Model trained status per user |
 | POST | /api/ml/retrain | admin | Retrain all user models |
 
+### Export
+| Method | Endpoint | Access | Description |
+|--------|----------|--------|-------------|
+| GET | /api/export/alerts | admin | Download alerts as CSV |
+| GET | /api/export/logs | admin | Download login logs as CSV |
+
 ---
 
 ## Dashboard Features
 
 ### Admin Dashboard
 - Stat cards: Total Users, Total Alerts, High Risk Alerts, Failed Logins
-- Failed Login Attempts by User table with Block/Unblock and Reset Password actions
-- ML Model Status panel — shows Trained/Not Trained per user with Retrain All button
+- Quick action buttons: Export Alerts CSV, Export Logs CSV, Risk Profiles, GeoIP Map
+- Failed Login Attempts by User — Block/Unblock, Reset Password, View Profile
+- ML Model Status panel — Trained/Not Trained per user, Retrain All button
 - Risk Score Trend line chart
+- Live Event Feed (5s auto-refresh, pause/resume)
 - Recent Alerts panel
 
 ### Admin Sub-pages
-- **Alerts** — Full alerts table with all anomaly reasons as bullet list, severity, risk bar
-- **Incidents** — All incidents with severity, status badges
-- **Users** — All registered users with roles
+- **Alerts** — Full table with anomaly bullet list, risk bar, severity, status
+- **Incidents** — All incidents with severity and status badges
+- **Log Search** — Splunk-style search, hourly chart, top IPs/locations, CSV export
+- **GeoIP Map** — World map with login pins, filter, hover tooltips
+- **Risk Profile** — Per-user risk history chart, baseline, alert history, PDF export
+- **Users** — All users with Active/Blocked status, Block/Unblock action
 
 ### Analyst Dashboard
-- Incident counts by status (New, Investigating, Resolved)
+- Incident counts by status
 - Recent incidents table
 
 ### Analyst Sub-pages
-- **Incidents** — Investigate modal: update status (New/Investigating/Resolved/Escalated) + notes, full anomaly list
-- **Login Logs** — All user login logs with IP, device, location, browser
+- **Incidents** — Investigate modal with status update, notes, full anomaly list
+- **Login Logs** — All login events with IP, device, location, browser
 
 ### User Dashboard
-- Successful logins count + Failed attempts count
-- Report Suspicious Activity button (creates incident for security team)
-- Change Password button
-- Security Alerts panel — shows all anomalies detected on their account with severity + risk score
+- Successful / Failed login counts
+- Report Suspicious Activity (creates incident)
+- Change Password
+- Security Alerts panel — all anomalies with severity + risk score + decay formula
 - Green "all clear" banner when no alerts
 - Full login history table
 
@@ -529,11 +695,16 @@ joblib
 
 ## Key Design Decisions
 
-1. **Rule-based + ML hybrid** — Rules catch known patterns (brute force, timing), ML catches unknown behavioral deviations
-2. **Per-user ML models** — Each user has their own Isolation Forest trained on their own history, not a global model
-3. **Auto-retraining** — Model retrains after every login so it continuously adapts to the user's behavior
-4. **Explainable scoring** — Every alert shows exactly which anomalies fired and their individual score contributions
-5. **Server-side geolocation** — IP resolved to city/region/country on the backend using ip-api.com
-6. **Server-side UA parsing** — Device and browser extracted from User-Agent header using the `user-agents` library
-7. **Single admin** — Admin account is pre-seeded only; registration API blocks `admin` role
-8. **Incident lifecycle** — Every alert automatically creates an incident (New → Investigating → Resolved/Escalated)
+1. **Rule-based + ML hybrid** — Rules catch known patterns, ML catches unknown behavioral deviations
+2. **Exponential decay scoring** — `score = prev × 0.8 + event` prevents score inflation; old risk fades naturally
+3. **Sliding time windows** — A1 uses last 10 min, A4 uses last 24h; events outside window are ignored
+4. **Success decay** — 3 consecutive clean logins reduce risk by 70%, rewarding normal behavior
+5. **A9 context-only** — Repeated alert history shown as info, not added to score (prevents compounding)
+6. **Score cap at 100** — No matter how many anomalies fire, score never exceeds 100
+7. **Auto-block at Critical (≥86)** — Immediate account lock on Critical, admin can manually unblock
+8. **Per-user ML models** — Each user has their own Isolation Forest, not a global model
+9. **Auto-retraining** — Model retrains after every login, continuously adapts to behavior
+10. **Server-side geolocation** — IP resolved to city/region/country using ip-api.com
+11. **Single admin** — Admin pre-seeded only; registration API blocks `admin` role
+12. **Incident lifecycle** — Every alert auto-creates an incident (New → Investigating → Resolved/Escalated)
+13. **Login screen warnings** — Progressive UI feedback at 2 and 3 failures, 5-min cooldown after threshold

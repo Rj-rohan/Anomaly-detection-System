@@ -1,24 +1,28 @@
 from db import supabase
 from alerts import dispatch_alert
-from ml_model import predict as ml_predict, train as ml_train, extract_features
+from ml_model import predict as ml_predict, train as ml_train
 from datetime import datetime, timezone, timedelta
 
 # ── thresholds ────────────────────────────────────────────────────────────────
-FAILED_THRESHOLD       = 5      # A1
-FAILED_WINDOW_MIN      = 10
-UNUSUAL_HOUR_START     = 22     # A2: 10 PM
-UNUSUAL_HOUR_END       = 6      # A2: 6 AM
-RESTRICTED_START       = 20     # A8: 8 PM  (org policy)
-RESTRICTED_END         = 8      # A8: 8 AM
-FREQ_WINDOW_HOURS      = 24     # A4
-FREQ_THRESHOLD         = 10     # A4: >10 logins/day suspicious
-TRAVEL_WINDOW_MIN      = 60     # A7: impossible travel window
-AVG_TRAVEL_SPEED_KMPH  = 900    # A7: max realistic speed (flight)
-REPEAT_ALERT_THRESHOLD = 5      # A9: alerts this month
+FAILED_THRESHOLD      = 5      # A1: failures in window
+FAILED_WINDOW_MIN     = 10     # A1: sliding window minutes
+UNUSUAL_HOUR_START    = 22     # A2: 10 PM
+UNUSUAL_HOUR_END      = 6      # A2: 6 AM
+RESTRICTED_START      = 20     # A8: 8 PM org policy
+RESTRICTED_END        = 8      # A8: 8 AM org policy
+FREQ_WINDOW_HOURS     = 24     # A4
+FREQ_THRESHOLD        = 10     # A4
+AVG_TRAVEL_SPEED_KMPH = 900    # A7
 
+# ── decay & window config ─────────────────────────────────────────────────────
+DECAY_FACTOR          = 0.8    # exponential decay: new = old * 0.8 + event_score
+SUCCESS_DECAY         = 0.3    # on clean login: risk = risk * 0.3
+CONSECUTIVE_CLEAN     = 3      # clean logins needed to apply success decay
+SCORE_CAP             = 100    # max score (0-100 scale)
 
-def _severity(score: int) -> str:
-    if score > 100: return "Critical"
+# ── severity (updated scale) ──────────────────────────────────────────────────
+def _severity(score: float) -> str:
+    if score >= 86: return "Critical"
     if score >= 61: return "High"
     if score >= 31: return "Medium"
     return "Low"
@@ -29,7 +33,6 @@ def _parse_dt(ts: str) -> datetime:
 
 
 def _haversine_km(loc1: str, loc2: str) -> float:
-    """Rough distance estimate by geocoding city names via nominatim."""
     import requests
     def geocode(place):
         try:
@@ -58,15 +61,34 @@ def _haversine_km(loc1: str, loc2: str) -> float:
     return 6371 * 2 * atan2(sqrt(a), sqrt(1 - a))
 
 
+def _get_previous_risk(user_id: str) -> float:
+    """Get the most recent risk score for this user (for decay calculation)."""
+    rows = (
+        supabase.table("alerts")
+        .select("risk_score, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if not rows:
+        return 0.0
+    return float(rows[0]["risk_score"])
+
+
 def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
             current_device: str = "Unknown", current_location: str = "Unknown"):
 
-    score = 0
+    event_score = 0
     reasons = []
     now = _parse_dt(timestamp)
-    hour = now.hour
+    # Convert to IST (UTC+5:30) for hour-based checks
+    ist_offset = timedelta(hours=5, minutes=30)
+    now_ist = now + ist_offset
+    hour = now_ist.hour
 
-    # Fetch last 50 login logs for this user
+    # Fetch last 50 logs (sliding window source)
     all_logs = (
         supabase.table("login_logs")
         .select("status, timestamp, device, location")
@@ -77,62 +99,99 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
         .data
     )
 
-    # Fetch user profile
-    rows = supabase.table("user_profiles").select("*").eq("user_id", user_id).limit(1).execute().data
-    profile = rows[0] if rows else None
+    profile_rows = supabase.table("user_profiles").select("*").eq("user_id", user_id).limit(1).execute().data
+    profile = profile_rows[0] if profile_rows else None
 
-    # ── A1: Multiple Failed Login Attempts ───────────────────────────────────
-    recent_failed = [
-        l for l in all_logs
-        if l["status"] == "failed"
-        and (now - _parse_dt(l["timestamp"])).total_seconds() <= FAILED_WINDOW_MIN * 60
-    ]
-    if len(recent_failed) >= FAILED_THRESHOLD:
-        score += 40
-        reasons.append(f"A1: Multiple failed login attempts ({len(recent_failed)} in {FAILED_WINDOW_MIN} min)")
+    # ── SUCCESS PATH: decay on clean login ───────────────────────────────────
+    if login_status == "success":
+        # Check consecutive clean logins (no anomalies in recent logs)
+        recent_success = [
+            l for l in all_logs
+            if l["status"] == "success"
+            and (now - _parse_dt(l["timestamp"])).total_seconds() <= 86400  # last 24h
+        ]
+        if len(recent_success) >= CONSECUTIVE_CLEAN:
+            prev_risk = _get_previous_risk(user_id)
+            if prev_risk > 0:
+                # Reduce previous risk heavily on verified clean behavior
+                decayed = round(prev_risk * SUCCESS_DECAY, 1)
+                reasons.append(
+                    f"DECAY: {CONSECUTIVE_CLEAN}+ consecutive clean logins — "
+                    f"risk reduced from {prev_risk} to {decayed}"
+                )
+                # Insert a decay record as a Low alert to track the reduction
+                supabase.table("alerts").insert({
+                    "user_id": user_id,
+                    "risk_score": int(decayed),
+                    "reason": " | ".join(reasons),
+                    "severity": "Low",
+                    "status": "closed",
+                }).execute()
+                _update_profile(user_id, hour, current_device, current_location, profile)
+                _retrain(user_id, all_logs, profile)
+                return
 
-    # ── A2: Unusual Login Timing (personal behavior) ──────────────────────────
-    is_unusual_personal = hour >= UNUSUAL_HOUR_START or hour < UNUSUAL_HOUR_END
-    if is_unusual_personal:
-        score += 30
-        reasons.append(f"A2: Unusual login timing ({hour:02d}:00 — outside normal hours)")
+        # A3: Consecutive failures → sudden success (still suspicious even on success)
+        if len(all_logs) >= 4:
+            recent_4 = all_logs[:4]
+            if all(l["status"] == "failed" for l in recent_4):
+                event_score += 20
+                reasons.append("A3: Consecutive failures followed by sudden success (possible credential guess)")
 
-    # ── A3: Consecutive Failures Followed by Sudden Success ──────────────────
-    if login_status == "success" and len(all_logs) >= 4:
-        recent_4 = all_logs[:4]  # most recent 4 before this login
-        if all(l["status"] == "failed" for l in recent_4):
-            score += 20
-            reasons.append("A3: Consecutive failures followed by sudden success (possible credential guess)")
+        if event_score == 0:
+            _update_profile(user_id, hour, current_device, current_location, profile)
+            _retrain(user_id, all_logs, profile)
+            return
 
-    # ── A4: Excessive Login Frequency ────────────────────────────────────────
-    window_start = now - timedelta(hours=FREQ_WINDOW_HOURS)
-    logins_today = [
-        l for l in all_logs
-        if _parse_dt(l["timestamp"]) >= window_start
-    ]
-    if len(logins_today) > FREQ_THRESHOLD:
-        score += 15
-        reasons.append(f"A4: Excessive login frequency ({len(logins_today)} logins in last {FREQ_WINDOW_HOURS}h)")
+    # ── FAILED PATH: sliding window anomaly detection ─────────────────────────
 
-    # ── A5: New Device Login ──────────────────────────────────────────────────
+    # A1: Failed attempts — SLIDING WINDOW only (last 10 min)
+    if login_status == "failed":
+        window_10m = now - timedelta(minutes=FAILED_WINDOW_MIN)
+        recent_failed = [
+            l for l in all_logs
+            if l["status"] == "failed"
+            and _parse_dt(l["timestamp"]) >= window_10m
+        ]
+        if len(recent_failed) >= FAILED_THRESHOLD:
+            event_score += 40
+            reasons.append(
+                f"A1: {len(recent_failed)} failed attempts in last {FAILED_WINDOW_MIN} min "
+                f"(threshold: {FAILED_THRESHOLD})"
+            )
+
+    # A2: Unusual timing — event-based, not cumulative
+    is_unusual = hour >= UNUSUAL_HOUR_START or hour < UNUSUAL_HOUR_END
+    if is_unusual:
+        event_score += 30
+        reasons.append(f"A2: Unusual login timing ({hour:02d}:00 IST — outside 6AM–10PM IST)")
+
+    # A4: Excessive frequency — SLIDING WINDOW (last 24h)
+    window_24h = now - timedelta(hours=FREQ_WINDOW_HOURS)
+    logins_24h = [l for l in all_logs if _parse_dt(l["timestamp"]) >= window_24h]
+    if len(logins_24h) > FREQ_THRESHOLD:
+        event_score += 15
+        reasons.append(f"A4: {len(logins_24h)} logins in last 24h (threshold: {FREQ_THRESHOLD})")
+
+    # A5: New device — only flag if user has established device history (3+ known)
     if profile and current_device not in ("Unknown", "Other"):
         known_devices = profile.get("known_devices") or []
-        if known_devices and current_device not in known_devices:
-            score += 15
-            reasons.append(f"A5: New device detected ({current_device} — not in known devices)")
+        if len(known_devices) >= 3 and current_device not in known_devices:
+            event_score += 15
+            reasons.append(f"A5: New device ({current_device})")
 
-    # ── A6: Location Change Anomaly ───────────────────────────────────────────
-    if profile and current_location not in ("Unknown",):
+    # A6: New location — only flag if user has established location history (3+ known)
+    if profile and current_location != "Unknown":
         known_locs = profile.get("known_locations") or []
-        if known_locs and current_location not in known_locs:
-            score += 20
-            reasons.append(f"A6: Unexpected location ({current_location} — not in known locations)")
+        if len(known_locs) >= 3 and current_location not in known_locs:
+            event_score += 20
+            reasons.append(f"A6: Unexpected location ({current_location})")
 
-    # ── A7: Impossible Travel ─────────────────────────────────────────────────
-    if current_location not in ("Unknown",) and all_logs:
-        prev_logs_with_loc = [l for l in all_logs if l.get("location") and l["location"] != "Unknown"]
-        if prev_logs_with_loc:
-            prev = prev_logs_with_loc[0]
+    # A7: Impossible travel
+    if current_location != "Unknown" and all_logs:
+        prev_with_loc = [l for l in all_logs if l.get("location") and l["location"] != "Unknown"]
+        if prev_with_loc:
+            prev = prev_with_loc[0]
             prev_loc = prev["location"]
             prev_time = _parse_dt(prev["timestamp"])
             time_diff_hrs = max((now - prev_time).total_seconds() / 3600, 0.01)
@@ -140,81 +199,89 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
                 dist_km = _haversine_km(prev_loc, current_location)
                 speed = dist_km / time_diff_hrs
                 if speed > AVG_TRAVEL_SPEED_KMPH and time_diff_hrs < 2:
-                    score += 35
+                    event_score += 35
                     reasons.append(
-                        f"A7: Impossible travel detected ({prev_loc} -> {current_location} "
+                        f"A7: Impossible travel ({prev_loc} → {current_location} "
                         f"in {time_diff_hrs:.1f}h, ~{int(speed)} km/h)"
                     )
 
-    # ── A8: Login During Restricted Hours (org policy) ────────────────────────
+    # A8: Restricted hours
     is_restricted = hour >= RESTRICTED_START or hour < RESTRICTED_END
-    if is_restricted and not is_unusual_personal:
-        # Only add if A2 didn't already fire (avoid double-counting same window)
-        score += 20
-        reasons.append(f"A8: Login during restricted hours ({hour:02d}:00 — policy: {RESTRICTED_END}AM–{RESTRICTED_START%12}PM)")
-    elif is_restricted and is_unusual_personal:
-        # A2 already fired, give partial extra for policy violation
-        score += 5
-        reasons.append(f"A8: Also violates org restricted hours policy")
+    if is_restricted and not is_unusual:
+        event_score += 20
+        reasons.append(f"A8: Restricted hours violation ({hour:02d}:00 IST)")
+    elif is_restricted and is_unusual:
+        event_score += 5
+        reasons.append("A8: Also violates org restricted hours")
 
-    # ── A9: Repeated Alert History ────────────────────────────────────────────
+    # A9: Repeated alerts — CONTEXT ONLY, time-decayed, does NOT add to score
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     past_alerts = (
         supabase.table("alerts")
-        .select("id")
+        .select("risk_score, created_at")
         .eq("user_id", user_id)
         .gte("created_at", month_start.isoformat())
+        .neq("severity", "Low")   # exclude decay records
         .execute()
         .data
     )
-    if len(past_alerts) >= REPEAT_ALERT_THRESHOLD:
-        score += 25
-        reasons.append(f"A9: Repeated suspicious activity ({len(past_alerts)} alerts this month)")
+    if len(past_alerts) >= 5:
+        reasons.append(
+            f"A9 [context]: {len(past_alerts)} alerts this month — "
+            f"repeated suspicious pattern (no score added)"
+        )
 
-    # ── ML: Isolation Forest prediction ──────────────────────────────────────
-    window_start_10m = now - timedelta(minutes=10)
+    # ── ML: Isolation Forest ──────────────────────────────────────────────────
+    window_10m_start = now - timedelta(minutes=10)
     failed_10m = sum(
         1 for l in all_logs
-        if l["status"] == "failed"
-        and _parse_dt(l["timestamp"]) >= window_start_10m
+        if l["status"] == "failed" and _parse_dt(l["timestamp"]) >= window_10m_start
     )
-    logins_24h = sum(
-        1 for l in all_logs
-        if _parse_dt(l["timestamp"]) >= now - timedelta(hours=24)
-    )
-    current_log_features = {
+    ml_result = ml_predict(user_id, {
         "timestamp": timestamp,
         "status": login_status,
         "device": current_device,
         "location": current_location,
         "failed_last_10m": failed_10m,
-        "logins_last_24h": max(logins_24h, 1),
-    }
-    ml_result = ml_predict(user_id, current_log_features, profile)
+        "logins_last_24h": max(len(logins_24h), 1),
+    }, profile)
 
-    if score == 0 and not ml_result.get("is_anomaly"):
+    ml_score = 0
+    if ml_result.get("active") and ml_result.get("is_anomaly") and event_score > 0:
+        # Only add ML score if rule engine already detected something
+        # Prevents ML from triggering alerts on its own for minor deviations
+        ml_score = ml_result.get("ml_score", 0)
+        if ml_score > 0:
+            reasons.append(
+                f"ML: Isolation Forest anomaly "
+                f"(raw={ml_result['anomaly_score']}, +{ml_score})"
+            )
+
+    # ── EXPONENTIAL DECAY FORMULA ─────────────────────────────────────────────
+    # final_score = previous_risk * 0.8 + current_event_score
+    # This means old risk fades unless new events keep it high
+    prev_risk = _get_previous_risk(user_id)
+    current_event_total = event_score + ml_score
+
+    if current_event_total == 0:
         _update_profile(user_id, hour, current_device, current_location, profile)
         _retrain(user_id, all_logs, profile)
         return
 
-    # Add ML score to rule score
-    ml_score = ml_result.get("ml_score", 0)
-    if ml_result.get("active") and ml_result.get("is_anomaly"):
-        score += ml_score
-        reasons.append(f"ML: Isolation Forest anomaly detected (score: {ml_result['anomaly_score']}, contribution: +{ml_score})")
+    final_score = round(prev_risk * DECAY_FACTOR + current_event_total, 1)
+    final_score = min(final_score, SCORE_CAP)  # cap at 100
 
-    if score == 0:
-        _update_profile(user_id, hour, current_device, current_location, profile)
-        _retrain(user_id, all_logs, profile)
-        return
+    severity = _severity(final_score)
 
-    severity = _severity(score)
+    reasons.insert(0,
+        f"Score: {prev_risk} × {DECAY_FACTOR} (decay) + {current_event_total} (event) = {final_score}"
+    )
 
     alert = (
         supabase.table("alerts")
         .insert({
             "user_id": user_id,
-            "risk_score": min(score, 150),
+            "risk_score": int(final_score),
             "reason": " | ".join(reasons),
             "severity": severity,
             "status": "open",
@@ -226,17 +293,19 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
     supabase.table("incidents").insert({
         "alert_id": alert["id"],
         "status": "New",
-        "notes": "",
+        "notes": "Auto-blocked by system" if severity == "Critical" else "",
     }).execute()
 
-    dispatch_alert(user_name, score, reasons, severity)
+    if severity == "Critical":
+        supabase.table("users").update({"is_blocked": True}).eq("id", user_id).execute()
+        reasons.append("AUTO-BLOCKED: Account blocked due to Critical risk score")
 
+    dispatch_alert(user_name, int(final_score), reasons, severity)
     _update_profile(user_id, hour, current_device, current_location, profile)
     _retrain(user_id, all_logs, profile)
 
 
 def _update_profile(user_id: str, hour: int, device: str, location: str, profile: dict):
-    """Update or create user baseline profile."""
     if profile:
         known_devices = list(set((profile.get("known_devices") or []) + ([device] if device != "Unknown" else [])))
         known_locs = list(set((profile.get("known_locations") or []) + ([location] if location != "Unknown" else [])))
@@ -257,7 +326,6 @@ def _update_profile(user_id: str, hour: int, device: str, location: str, profile
 
 
 def _retrain(user_id: str, all_logs: list, profile: dict):
-    """Retrain Isolation Forest model for this user using latest logs."""
     try:
         enriched = []
         for i, l in enumerate(all_logs):
@@ -265,11 +333,10 @@ def _retrain(user_id: str, all_logs: list, profile: dict):
                 dt = _parse_dt(l["timestamp"])
             except Exception:
                 continue
-            window_10m = dt - timedelta(minutes=10)
+            w10 = dt - timedelta(minutes=10)
             failed_10m = sum(
                 1 for prev in all_logs[:i]
-                if prev["status"] == "failed"
-                and _parse_dt(prev["timestamp"]) >= window_10m
+                if prev["status"] == "failed" and _parse_dt(prev["timestamp"]) >= w10
             )
             logins_24h = sum(
                 1 for prev in all_logs[:i]

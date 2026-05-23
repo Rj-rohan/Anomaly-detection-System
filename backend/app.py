@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 import requests as http
 from user_agents import parse as parse_ua
@@ -15,7 +15,10 @@ CORS(app, origins=["http://localhost:3000"])
 
 def get_token():
     h = request.headers.get("Authorization", "")
-    return h.replace("Bearer ", "") if h.startswith("Bearer ") else None
+    if h.startswith("Bearer "):
+        return h.replace("Bearer ", "")
+    # Also accept token as query param (for CSV download links)
+    return request.args.get("token") or None
 
 def require_auth(roles=None):
     def decorator(fn):
@@ -319,6 +322,174 @@ def ml_status():
             "log_count": log_count,
         })
     return jsonify(result)
+
+# ── Splunk-style log search ──────────────────────────────────────────────────
+
+@app.get("/api/logs/search")
+@require_auth(["admin", "analyst"])
+def search_logs():
+    q = request.args.get("q", "").lower()
+    status = request.args.get("status", "")
+    date_from = request.args.get("from", "")
+    date_to = request.args.get("to", "")
+    limit = int(request.args.get("limit", 100))
+
+    query = supabase.table("login_logs").select("*, users(name,email)").order("timestamp", desc=True).limit(500)
+    if status:
+        query = query.eq("status", status)
+    if date_from:
+        query = query.gte("timestamp", date_from)
+    if date_to:
+        query = query.lte("timestamp", date_to)
+
+    data = query.execute().data
+    if q:
+        data = [l for l in data if
+            q in (l.get("ip_address") or "").lower() or
+            q in (l.get("location") or "").lower() or
+            q in (l.get("device") or "").lower() or
+            q in (l.get("browser") or "").lower() or
+            q in (l.get("users", {}).get("name") or "").lower() or
+            q in (l.get("users", {}).get("email") or "").lower()
+        ]
+    return jsonify(data[:limit])
+
+@app.get("/api/logs/stats")
+@require_auth(["admin", "analyst"])
+def log_stats():
+    data = supabase.table("login_logs").select("status, timestamp, ip_address, location").order("timestamp", desc=True).limit(1000).execute().data
+    from collections import Counter
+    ip_counts = Counter(l["ip_address"] for l in data if l.get("ip_address"))
+    loc_counts = Counter(l["location"] for l in data if l.get("location") and l["location"] != "Unknown")
+    # events per hour (last 24h)
+    from datetime import timedelta
+    now = datetime.now(timezone.utc)
+    hourly = Counter()
+    for l in data:
+        try:
+            dt = datetime.fromisoformat(l["timestamp"].replace("Z", "+00:00"))
+            if (now - dt).total_seconds() <= 86400:
+                hourly[dt.strftime("%H:00")] += 1
+        except Exception:
+            pass
+    return jsonify({
+        "total": len(data),
+        "success": sum(1 for l in data if l["status"] == "success"),
+        "failed": sum(1 for l in data if l["status"] == "failed"),
+        "top_ips": [{ "ip": k, "count": v } for k, v in ip_counts.most_common(10)],
+        "top_locations": [{ "location": k, "count": v } for k, v in loc_counts.most_common(10)],
+        "hourly": [{ "hour": k, "count": v } for k, v in sorted(hourly.items())],
+    })
+
+# ── GeoIP map data ────────────────────────────────────────────────────────────
+
+@app.get("/api/logs/geo")
+@require_auth(["admin", "analyst"])
+def geo_data():
+    data = supabase.table("login_logs").select("status, location, ip_address, timestamp, users(name)").order("timestamp", desc=True).limit(500).execute().data
+    # Geocode unique locations
+    unique_locs = list({l["location"] for l in data if l.get("location") and l["location"] != "Unknown"})
+    coords = {}
+    for loc in unique_locs[:30]:  # limit geocoding calls
+        try:
+            r = http.get("https://nominatim.openstreetmap.org/search",
+                params={"q": loc, "format": "json", "limit": 1},
+                headers={"User-Agent": "anomaly-detector/1.0"}, timeout=4).json()
+            if r:
+                coords[loc] = {"lat": float(r[0]["lat"]), "lng": float(r[0]["lon"])}
+        except Exception:
+            pass
+    result = []
+    for l in data:
+        loc = l.get("location", "Unknown")
+        if loc in coords:
+            result.append({
+                "location": loc,
+                "lat": coords[loc]["lat"],
+                "lng": coords[loc]["lng"],
+                "status": l["status"],
+                "user": l.get("users", {}).get("name", "Unknown"),
+                "timestamp": l["timestamp"],
+            })
+    return jsonify(result)
+
+# ── User risk profile ─────────────────────────────────────────────────────────
+
+@app.get("/api/users/<uid>/risk-profile")
+@require_auth(["admin", "analyst"])
+def user_risk_profile(uid):
+    user = supabase.table("users").select("id,name,email,role,is_blocked").eq("id", uid).limit(1).execute().data
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    profile = supabase.table("user_profiles").select("*").eq("user_id", uid).limit(1).execute().data
+    alerts = supabase.table("alerts").select("*").eq("user_id", uid).order("created_at", desc=True).limit(20).execute().data
+    logs = supabase.table("login_logs").select("status, timestamp, location, device").eq("user_id", uid).order("timestamp", desc=True).limit(50).execute().data
+    total_score = sum(a["risk_score"] for a in alerts)
+    latest_score = alerts[0]["risk_score"] if alerts else 0
+    latest_severity = alerts[0]["severity"] if alerts else "Low"
+    return jsonify({
+        "user": user[0],
+        "profile": profile[0] if profile else None,
+        "alerts": alerts,
+        "recent_logs": logs[:10],
+        "current_risk_score": latest_score,
+        "current_severity": latest_severity,
+        "alert_count": len(alerts),
+        "failed_logins": sum(1 for l in logs if l["status"] == "failed"),
+        "risk_history": [{"date": a["created_at"][:10], "score": a["risk_score"], "severity": a["severity"]} for a in alerts],
+    })
+
+# ── CSV export ────────────────────────────────────────────────────────────────
+
+@app.get("/api/export/alerts")
+@require_auth(["admin"])
+def export_alerts():
+    import csv, io
+    data = supabase.table("alerts").select("*, users(name,email)").order("created_at", desc=True).execute().data
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["User", "Email", "Risk Score", "Severity", "Reason", "Status", "Created At"])
+    for a in data:
+        w.writerow([a.get("users", {}).get("name", ""), a.get("users", {}).get("email", ""),
+                    a["risk_score"], a["severity"], a["reason"], a["status"], a["created_at"]])
+    from flask import Response
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment;filename=alerts.csv"})
+
+@app.get("/api/export/logs")
+@require_auth(["admin"])
+def export_logs():
+    import csv, io
+    data = supabase.table("login_logs").select("*, users(name,email)").order("timestamp", desc=True).limit(1000).execute().data
+    output = io.StringIO()
+    w = csv.writer(output)
+    w.writerow(["User", "Email", "Status", "IP Address", "Device", "Browser", "Location", "Timestamp"])
+    for l in data:
+        w.writerow([l.get("users", {}).get("name", ""), l.get("users", {}).get("email", ""),
+                    l["status"], l["ip_address"], l["device"], l["browser"], l["location"], l["timestamp"]])
+    from flask import Response
+    return Response(output.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment;filename=login_logs.csv"})
+
+# ── Real-time feed (polling) ──────────────────────────────────────────────────
+
+@app.get("/api/feed/latest")
+@require_auth(["admin", "analyst"])
+def latest_feed():
+    """Returns last 20 alerts + logs combined, sorted by time — for live feed polling."""
+    alerts = supabase.table("alerts").select("id, risk_score, severity, reason, created_at, users(name)").order("created_at", desc=True).limit(10).execute().data
+    logs = supabase.table("login_logs").select("id, status, ip_address, location, timestamp, users(name)").order("timestamp", desc=True).limit(10).execute().data
+    feed = []
+    for a in alerts:
+        feed.append({"type": "alert", "time": a["created_at"], "user": a.get("users", {}).get("name", "?"),
+                     "message": f"Risk {a['risk_score']} — {a['reason'].split(' | ')[0] if a.get('reason') else ''}",
+                     "severity": a["severity"]})
+    for l in logs:
+        feed.append({"type": "login", "time": l["timestamp"], "user": l.get("users", {}).get("name", "?"),
+                     "message": f"{l['status'].upper()} from {l.get('location','?')} ({l.get('ip_address','?')})",
+                     "severity": "Low" if l["status"] == "success" else "Medium"})
+    feed.sort(key=lambda x: x["time"], reverse=True)
+    return jsonify(feed[:20])
 
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
