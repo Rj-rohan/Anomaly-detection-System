@@ -10,13 +10,17 @@ phases:
       python: 3.11
       nodejs: 18
     commands:
-      - echo "Installing backend dependencies..."
-      - pip install -r backend/requirements.txt
-      - echo "Installing frontend dependencies..."
-      - npm install --prefix frontend/my-app
+      - echo "Runtime versions installed"
+      - node --version
+      - npm --version
+      - python3 --version
 
   pre_build:
     commands:
+      - echo "Installing backend dependencies..."
+      - pip3 install -r backend/requirements.txt
+      - echo "Installing frontend dependencies..."
+      - npm install --prefix frontend/my-app
       - echo "Writing backend .env..."
       - echo "SUPABASE_URL=${SUPABASE_URL}" > backend/.env
       - echo "SUPABASE_KEY=${SUPABASE_KEY}" >> backend/.env
@@ -32,7 +36,7 @@ phases:
       - echo "NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}" > frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}" >> frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}" >> frontend/my-app/.env.local
-      - echo "Env files written"
+      - echo "Pre-build done"
 
   build:
     commands:
