@@ -10,7 +10,7 @@ phases:
       python: 3.11
       nodejs: 18
     commands:
-      - echo "Runtime versions installed"
+      - echo "Runtime ready"
       - node --version
       - npm --version
       - python3 --version
@@ -20,7 +20,7 @@ phases:
       - echo "Installing backend dependencies..."
       - pip3 install -r backend/requirements.txt
       - echo "Installing frontend dependencies..."
-      - npm install --prefix frontend/my-app
+      - pushd frontend/my-app && npm install && popd
       - echo "Writing backend .env..."
       - echo "SUPABASE_URL=${SUPABASE_URL}" > backend/.env
       - echo "SUPABASE_KEY=${SUPABASE_KEY}" >> backend/.env
@@ -41,7 +41,7 @@ phases:
   build:
     commands:
       - echo "Building Next.js frontend..."
-      - npm run build --prefix frontend/my-app
+      - pushd frontend/my-app && npm run build && popd
       - echo "Creating models directory..."
       - mkdir -p backend/models
       - echo "Packaging backend..."
