@@ -78,7 +78,8 @@ def _get_previous_risk(user_id: str) -> float:
 
 
 def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
-            current_device: str = "Unknown", current_location: str = "Unknown"):
+            current_device: str = "Unknown", current_location: str = "Unknown",
+            current_ip: str = "Unknown"):
 
     event_score = 0
     reasons = []
@@ -91,7 +92,7 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
     # Fetch last 50 logs (sliding window source)
     all_logs = (
         supabase.table("login_logs")
-        .select("status, timestamp, device, location")
+        .select("status, timestamp, device, location, ip_address")
         .eq("user_id", user_id)
         .order("timestamp", desc=True)
         .limit(50)
@@ -187,6 +188,27 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
             event_score += 20
             reasons.append(f"A6: Unexpected location ({current_location})")
 
+    # A10: Device or IP change — explicit check (always active after 1st login)
+    prev_logs = [l for l in all_logs[1:] if l.get("device") and l["device"] != "Unknown"]
+    if prev_logs and current_device not in ("Unknown", "Other"):
+        prev_device = prev_logs[0]["device"]
+        prev_ip = prev_logs[0].get("ip_address", "Unknown")
+        device_changed = prev_device != current_device
+        ip_changed = prev_ip != "Unknown" and current_ip != "Unknown" and prev_ip != current_ip
+        if device_changed and ip_changed:
+            event_score += 20
+            reasons.append(
+                f"A10: Device AND IP changed — "
+                f"device: {prev_device} → {current_device}, "
+                f"IP: {prev_ip} → {current_ip}"
+            )
+        elif device_changed:
+            event_score += 20
+            reasons.append(f"A10: Device changed ({prev_device} → {current_device})")
+        elif ip_changed:
+            event_score += 20
+            reasons.append(f"A10: IP address changed ({prev_ip} → {current_ip})")
+
     # A7: Impossible travel
     if current_location != "Unknown" and all_logs:
         prev_with_loc = [l for l in all_logs if l.get("location") and l["location"] != "Unknown"]
@@ -205,14 +227,31 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
                         f"in {time_diff_hrs:.1f}h, ~{int(speed)} km/h)"
                     )
 
-    # A8: Restricted hours
-    is_restricted = hour >= RESTRICTED_START or hour < RESTRICTED_END
+    # A8: Restricted hours — use per-user policy if set, else global policy
+    user_restricted_start = profile.get("restricted_start") if profile else None
+    user_restricted_end   = profile.get("restricted_end")   if profile else None
+
+    if user_restricted_start is not None and user_restricted_end is not None:
+        # Per-user: restricted_start and restricted_end define the RESTRICTED range
+        # e.g. start=6, end=17 means 6AM-5PM is restricted (login not allowed)
+        if user_restricted_start < user_restricted_end:
+            # Contiguous range: e.g. 6AM-5PM
+            is_restricted = user_restricted_start <= hour < user_restricted_end
+        else:
+            # Overnight range: e.g. 10PM-6AM
+            is_restricted = hour >= user_restricted_start or hour < user_restricted_end
+        policy_label = f"{user_restricted_start}:00-{user_restricted_end}:00 IST (custom policy)"
+    else:
+        # Global org policy
+        is_restricted = hour >= RESTRICTED_START or hour < RESTRICTED_END
+        policy_label  = f"{RESTRICTED_END}AM-8PM IST (org policy)"
+
     if is_restricted and not is_unusual:
         event_score += 20
-        reasons.append(f"A8: Restricted hours violation ({hour:02d}:00 IST)")
+        reasons.append(f"A8: Restricted hours violation ({hour:02d}:00 IST — restricted window: {policy_label})")
     elif is_restricted and is_unusual:
         event_score += 5
-        reasons.append("A8: Also violates org restricted hours")
+        reasons.append(f"A8: Also violates restricted hours ({policy_label})")
 
     # A9: Repeated alerts — CONTEXT ONLY, time-decayed, does NOT add to score
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -298,7 +337,7 @@ def analyze(user_id: str, user_name: str, login_status: str, timestamp: str,
 
     if severity == "Critical":
         supabase.table("users").update({"is_blocked": True}).eq("id", user_id).execute()
-        reasons.append("AUTO-BLOCKED: Account blocked due to Critical risk score")
+        reasons.append("AUTO-BLOCKED: Account blocked due to Critical risk score (86+)")
 
     dispatch_alert(user_name, int(final_score), reasons, severity)
     _update_profile(user_id, hour, current_device, current_location, profile)

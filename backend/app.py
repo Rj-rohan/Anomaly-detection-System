@@ -112,7 +112,7 @@ def login():
             "browser": browser[:120] or "Unknown",
             "location": location,
         }).execute()
-        analyze(uid, uname, status, ts, current_device=device or "Unknown", current_location=location)
+        analyze(uid, uname, status, ts, current_device=device or "Unknown", current_location=location, current_ip=ip)
 
     if status == "failed":
         return jsonify({"error": "Invalid credentials"}), 401
