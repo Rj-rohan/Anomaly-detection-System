@@ -5,3 +5,7 @@ python-jose[cryptography]
 bcrypt
 python-dotenv
 requests
+user-agents
+scikit-learn
+numpy
+joblib
