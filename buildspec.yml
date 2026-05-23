@@ -20,7 +20,7 @@ phases:
       - echo "Installing backend dependencies..."
       - pip3 install -r backend/requirements.txt
       - echo "Installing frontend dependencies..."
-      - pushd frontend/my-app && npm install && popd
+      - pushd frontend/my-app && npm install --legacy-peer-deps && popd
       - echo "Writing backend .env..."
       - echo "SUPABASE_URL=${SUPABASE_URL}" > backend/.env
       - echo "SUPABASE_KEY=${SUPABASE_KEY}" >> backend/.env
@@ -36,12 +36,13 @@ phases:
       - echo "NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}" > frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY}" >> frontend/my-app/.env.local
       - echo "NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}" >> frontend/my-app/.env.local
+      - cat frontend/my-app/.env.local
       - echo "Pre-build done"
 
   build:
     commands:
       - echo "Building Next.js frontend..."
-      - pushd frontend/my-app && npm run build && popd
+      - pushd frontend/my-app && npm run build 2>&1 || (echo "BUILD FAILED - showing last 50 lines of output above" && exit 1) && popd
       - echo "Creating models directory..."
       - mkdir -p backend/models
       - echo "Packaging backend..."
